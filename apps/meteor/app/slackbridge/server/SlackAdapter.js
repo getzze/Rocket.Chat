@@ -10,6 +10,7 @@ import { Meteor } from 'meteor/meteor';
 
 import { saveRoomName, saveRoomTopic } from '../../channel-settings/server';
 import { FileUpload } from '../../file-upload/server';
+import { parseFileIntoMessageAttachments } from '../../file-upload/server/methods/sendFileMessage';
 import { addUserToRoom } from '../../lib/server/functions/addUserToRoom';
 import { archiveRoom } from '../../lib/server/functions/archiveRoom';
 import { deleteMessage } from '../../lib/server/functions/deleteMessage';
@@ -916,32 +917,64 @@ export default class SlackAdapter {
 	}
 
 	async processFileShare(slackMessage) {
+		// TODO: add as User defined settings
+		const slack_urls = ['https://files.slack.com'];
+		const size_limit = 50000000;
+		
 		if (!settings.get('SlackBridge_FileUpload_Enabled')) {
 			return;
 		}
-		const file = slackMessage.files[0];
+		var permalinks = [];
+		var files = [];
+		for (const file of slackMessage.files) {
+			if (file && file.size < size_limit && file.url_private_download !== undefined &&
+				slack_urls.some(word => file.url_private_download.startsWith(word))) {
+  				files.push(file);
+			} else {
+				permalinks.push(file.permalink);
+			}
+		}
+		const rocketChannel = await this.rocket.getChannel(slackMessage);
+		const rocketUser = await this.rocket.getUser(slackMessage.user);
 
-		if (file && file.url_private_download !== undefined) {
-			const rocketChannel = await this.rocket.getChannel(slackMessage);
-			const rocketUser = await this.rocket.getUser(slackMessage.user);
+		// Default message data
+		var msgDataDefaults = {
+			_id: this.rocket.createRocketID(slackMessage.channel, slackMessage.ts),
+			// TODO: create a function to transform Slack ts to Rocket ts to make sure it is always done the same way
+			ts: new Date(parseInt(slackMessage.ts.split('.')[0]) * 1000),
+			updatedBySlack: true,
+		};
 
-			// Hack to notify that a file was attempted to be uploaded
-			delete slackMessage.subtype;
+		// Hack to notify that a file was attempted to be uploaded
+		delete slackMessage.subtype;
 
-			// If the text includes the file link, simply use the same text for the rocket message.
-			// If the link was not included, then use it instead of the message.
-
-			if (slackMessage.text.indexOf(file.permalink) < 0) {
-				slackMessage.text = file.permalink;
+		const is_thread = 'thread_ts' in slackMessage;
+		// TODO: make sure we have to do that
+		if (!is_thread) {
+			// Send the original message without attachment, to make sure the threads are conserved
+			await this.rocket.createAndSaveMessage(rocketChannel, rocketUser, slackMessage, msgDataDefaults, false);
+			slackMessage.thread_ts = slackMessage.ts;
+			msgDataDefaults.fake_thread = true;
+		}
+		// Send the attached files in a thread below the original message
+		if (files) {
+			var msgData = {...msgDataDefaults};
+			const tmessage = await Messages.findOneBySlackTs(slackMessage.thread_ts);
+			if (tmessage) {
+				msgData.tmid = tmessage._id;
+			}
+			msgData.files = files;
+			try {
+  				await this.processShareMessage(rocketChannel, rocketUser, slackMessage, msgData, false);
+				return;
+			} catch (error) {
+  				slackLogger.debug('Error uploading file: ', error, '| stacktrace: ', error.stack);
 			}
 
-			const ts = new Date(parseInt(slackMessage.ts.split('.')[0]) * 1000);
-			const msgDataDefaults = {
-				_id: this.rocket.createRocketID(slackMessage.channel, slackMessage.ts),
-				ts,
-				updatedBySlack: true,
-			};
-
+			// If errored, just send the permalinks faking a Slack thread
+			if (permalinks) {
+				slackMessage.text = permalinks.join("\n");
+			}
 			await this.rocket.createAndSaveMessage(rocketChannel, rocketUser, slackMessage, msgDataDefaults, false);
 		}
 	}
@@ -973,6 +1006,34 @@ export default class SlackAdapter {
 				}
 			}
 		}
+	}
+
+	async downloadPayload(slackMessage) {
+		// TODO: add as User defined settings
+		const slack_urls = ['https://files.slack.com'];
+		const size_limit = 50000000;
+
+		const file = slackMessage.files[0];
+		const payloads = [];
+
+		for (const file of slackMessage.files) {
+			if (file && file.url_private_download !== undefined) {
+				const link = file.url_private_download;
+				const filename = file.name;
+				if (slack_urls.some(word => link.startsWith(word)) && file.size < size_limit) {
+					slackLogger.debug('Found file to download', link);
+					const payload = await this.slackAPI.getPayload(link);
+					payloads.push({
+						filename: filename,
+						payload: payload,
+						size: file.size,
+						mimetype: file.mimetype,
+					});
+				}
+			}
+		}
+		slackLogger.debug('Payloads:', payloads);
+		return payloads;
 	}
 
 	/*
@@ -1147,24 +1208,33 @@ export default class SlackAdapter {
 		}
 	}
 
-	async processShareMessage(rocketChannel, rocketUser, slackMessage, isImporting) {
-		if (slackMessage.file && slackMessage.file.url_private_download !== undefined) {
-			const details = {
-				message_id: this.createSlackMessageId(slackMessage.ts),
-				name: slackMessage.file.name,
-				size: slackMessage.file.size,
-				type: slackMessage.file.mimetype,
-				rid: rocketChannel._id,
-			};
-			return this.uploadFileFromSlack(
-				details,
-				slackMessage.file.url_private_download,
-				rocketUser,
-				rocketChannel,
-				new Date(parseInt(slackMessage.ts.split('.')[0]) * 1000),
-				isImporting,
-			);
+	async processShareMessage(rocketChannel, rocketUser, slackMessage, msgDataDefaults, isImporting) {
+		// Modify message_id to be different for each attachment
+		var ind = 1;
+		for (const file of msgDataDefaults.files) {
+			var mid = msgDataDefaults._id;
+			if (msgDataDefaults.fake_thread || ind > 1) {
+				mid = mid.concat('-', ind);
 		}
+		const details = {
+			message_id: mid,
+			name: file.name,
+			size: file.size,
+			type: file.mimetype,
+			tmid: msgDataDefaults.tmid,
+			userId: rocketUser._id,
+			rid: rocketChannel._id
+		};
+		slackLogger.debug('Upload file:', file);
+		await this.uploadFileFromSlack(
+			details,
+			file.url_private_download,
+			rocketUser,
+			rocketChannel,
+			msgDataDefaults.ts,
+			isImporting,
+		)
+		ind += 1;
 	}
 
 	async processPinnedItemMessage(rocketChannel, rocketUser, slackMessage, isImporting) {
@@ -1236,7 +1306,8 @@ export default class SlackAdapter {
 				}
 				return;
 			case 'file_share':
-				return this.processShareMessage(rocketChannel, rocketUser, slackMessage, isImporting);
+				slackLogger.error('File share not implemented');
+				return;
 			case 'file_comment':
 				slackLogger.error('File comment not implemented');
 				return;
@@ -1258,60 +1329,31 @@ export default class SlackAdapter {
 	@param [Object] room the Rocket.Chat room
 	@param [Date] timeStamp the timestamp the file was uploaded
 	**/
-	// details, slackMessage.file.url_private_download, rocketUser, rocketChannel, new Date(parseInt(slackMessage.ts.split('.')[0]) * 1000), isImporting);
 	async uploadFileFromSlack(details, slackFileURL, rocketUser, rocketChannel, timeStamp, isImporting) {
-		const requestModule = /https/i.test(slackFileURL) ? https : http;
-		const parsedUrl = url.parse(slackFileURL, true);
-		parsedUrl.headers = { Authorization: `Bearer ${this.apiToken}` };
-		await requestModule.get(parsedUrl, async (stream) => {
-			const fileStore = FileUpload.getStore('Uploads');
+		slackLogger.debug('Upload file from Slack: ', slackFileURL, ' with timestamp ', timeStamp, ' and id ', details.message_id);
+		const stream = await this.slackAPI.getPayload(slackFileURL);
+		const fileStore = FileUpload.getStore('Uploads');
 
-			const file = await fileStore.insert(details, stream);
+		const uploadedFile = await fileStore.insert(details, stream);
+		const { files, attachments } = await parseFileIntoMessageAttachments(uploadedFile, rocketChannel._id, rocketUser);
 
-			const url = file.url.replace(Meteor.absoluteUrl(), '/');
-			const attachment = {
-				title: file.name,
-				title_link: url,
-			};
-
-			if (/^image\/.+/.test(file.type)) {
-				attachment.image_url = url;
-				attachment.image_type = file.type;
-				attachment.image_size = file.size;
-				attachment.image_dimensions = file.identify && file.identify.size;
-			}
-			if (/^audio\/.+/.test(file.type)) {
-				attachment.audio_url = url;
-				attachment.audio_type = file.type;
-				attachment.audio_size = file.size;
-			}
-			if (/^video\/.+/.test(file.type)) {
-				attachment.video_url = url;
-				attachment.video_type = file.type;
-				attachment.video_size = file.size;
-			}
-
-			const msg = {
-				rid: details.rid,
-				ts: timeStamp,
-				msg: '',
-				file: {
-					_id: file._id,
-				},
-				groupable: false,
-				attachments: [attachment],
-			};
-
-			if (isImporting) {
-				msg.imported = 'slackbridge';
-			}
-
-			if (details.message_id && typeof details.message_id === 'string') {
-				msg._id = details.message_id;
-			}
-
-			void sendMessage(rocketUser, msg, rocketChannel, true);
-		});
+		const msg = {
+			rid: details.rid,
+			ts: timeStamp,
+			tmid: details.tmid,
+			msg: '',
+			//file: files[0],
+			updatedBySlack: true,
+			groupable: false,
+			attachments: attachments
+		};
+		if (isImporting) {
+			msg.imported = 'slackbridge';
+		}
+		if (details.message_id && typeof details.message_id === 'string') {
+			msg._id = details.message_id;
+		}
+		return await sendMessage(rocketUser, msg, rocketChannel, true);
 	}
 
 	async importFromHistory(options) {
