@@ -20,7 +20,7 @@ export class SlackAPI {
 		});
 		const response = await request.json();
 
-		if (response && response && Array.isArray(response.channels) && response.channels.length > 0) {
+		if (response && Array.isArray(response.channels) && response.channels.length > 0) {
 			channels = channels.concat(response.channels);
 			if (response.response_metadata && response.response_metadata.next_cursor) {
 				const nextChannels = await this.getChannels(response.response_metadata.next_cursor);
@@ -100,6 +100,18 @@ export class SlackAPI {
 		}
 		return members;
 	}
+
+	async getPayload(link) {
+		const request = await fetch(link, {
+		        headers: {
+				Authorization: "Bearer ".concat(this.token)
+		        },
+		        method: 'GET'
+		});
+		// const response = await request.buffer();
+		const response = request.body;
+		return response;
+	};
 
 	async react(data) {
 		const request = await fetch('https://slack.com/api/reactions.add', {
